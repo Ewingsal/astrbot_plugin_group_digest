@@ -1,0 +1,2 @@
+# AstrBot 运行时会提供 astrbot 包。
+# 当前 MVP 无额外运行时第三方依赖。

@@ -1,0 +1,107 @@
+{
+  "title_template": {
+    "type": "string",
+    "description": "日报标题模板，支持 {date} 占位符",
+    "default": "群聊兴趣日报（{date}）"
+  },
+  "astrbot_data_dir": {
+    "type": "string",
+    "description": "AstrBot data 目录绝对路径。留空时自动推断。",
+    "default": ""
+  },
+  "storage_path": {
+    "type": "string",
+    "description": "消息归档文件路径。相对路径将拼接到 data 目录下。",
+    "default": "plugin_data/astrbot_plugin_group_digest/messages.json"
+  },
+  "group_origin_storage_path": {
+    "type": "string",
+    "description": "群会话标识映射存储路径。相对路径将拼接到 data 目录下。",
+    "default": "plugin_data/astrbot_plugin_group_digest/group_origins.json"
+  },
+  "report_cache_path": {
+    "type": "string",
+    "description": "日报缓存文件路径。相对路径将拼接到 data 目录下。",
+    "default": "plugin_data/astrbot_plugin_group_digest/report_cache.json"
+  },
+  "max_active_members": {
+    "type": "int",
+    "description": "活跃成员排行展示数量",
+    "default": 5
+  },
+  "max_topics": {
+    "type": "int",
+    "description": "热门话题展示数量上限（用于约束 LLM 输出）",
+    "default": 5
+  },
+  "use_llm_topic_analysis": {
+    "type": "bool",
+    "description": "是否启用 LLM 语义分析（热门话题/成员兴趣/整体总结/主动发言）",
+    "default": true
+  },
+  "analysis_provider_id": {
+    "type": "string",
+    "description": "用于语义分析的模型 provider ID。留空时复用当前会话模型。",
+    "default": ""
+  },
+  "analysis_prompt_template": {
+    "type": "text",
+    "description": "话题分析 Prompt 模板，支持 {group_id} {date_label} {time_window} {messages_json} {max_topics}",
+    "default": "你是一个群聊日报语义分析助手。请根据提供的群聊消息，输出严格 JSON。\\n统计日期：{date_label}\\n统计范围：{time_window}\\n群组：{group_id}\\n消息样本（JSON 数组）：\\n{messages_json}\\n\\n要求：\\n1. 输出必须是 JSON 对象，不要输出额外解释。\\n2. 你需要给出热门话题、成员兴趣摘要、整体总结。\\n3. 热门话题控制在 3-{max_topics} 条。\\n4. 成员兴趣摘要的 key 请使用成员昵称。\\n\\nJSON Schema（字段名必须一致）：\\n{{\\n  \"group_topics\": [\"话题1\", \"话题2\"],\\n  \"member_interests\": {{\"成员A\": \"兴趣摘要\", \"成员B\": \"兴趣摘要\"}},\\n  \"overall_summary\": \"整体总结\"\\n}}"
+  },
+  "interaction_prompt_template": {
+    "type": "text",
+    "description": "主动发言 Prompt 模板，支持 {group_id} {date_label} {time_window} {group_topics_json} {member_interests_json} {overall_summary}",
+    "default": "你是一个会主动参与群聊的助手。请基于分析结果输出严格 JSON。\\n统计日期：{date_label}\\n统计范围：{time_window}\\n群组：{group_id}\\n热门话题：{group_topics_json}\\n成员兴趣摘要：{member_interests_json}\\n整体总结：{overall_summary}\\n\\n要求：\\n1. suggested_bot_reply 要自然、友好、可直接发到群里。\\n2. 长度控制在 1-2 句。\\n3. 不要使用说教语气。\\n\\n仅输出 JSON：\\n{{\\n  \"suggested_bot_reply\": \"...\"\\n}}"
+  },
+  "max_messages_for_analysis": {
+    "type": "int",
+    "description": "送入 LLM 分析的最大消息条数（默认保留最近 N 条，值越大分析越全面但耗时更高）",
+    "default": 80
+  },
+  "fallback_to_stats_only": {
+    "type": "bool",
+    "description": "LLM 不可用或解析失败时，是否降级为仅统计结果",
+    "default": true
+  },
+  "enable_scheduled_proactive_message": {
+    "type": "bool",
+    "description": "是否启用每日定时主动发言。",
+    "default": false
+  },
+  "scheduled_send_hour": {
+    "type": "int",
+    "description": "定时主动发言触发小时（0-23）。",
+    "default": 18
+  },
+  "scheduled_send_minute": {
+    "type": "int",
+    "description": "定时主动发言触发分钟（0-59）。",
+    "default": 0
+  },
+  "scheduled_mode": {
+    "type": "string",
+    "description": "定时统计模式。当前仅支持 today_until_scheduled_time。",
+    "default": "today_until_scheduled_time"
+  },
+  "store_group_origin": {
+    "type": "bool",
+    "description": "是否在群聊消息到达时记录 unified_msg_origin（用于后续主动发送）。",
+    "default": true
+  },
+  "scheduled_group_whitelist_enabled": {
+    "type": "bool",
+    "description": "是否启用群白名单。",
+    "default": false
+  },
+  "scheduled_group_whitelist": {
+    "type": "list",
+    "description": "群白名单（group_id 列表）。白名单启用时仅这些群会执行定时主动发言。",
+    "default": []
+  },
+  "scheduled_send_timezone": {
+    "type": "string",
+    "description": "定时任务使用的时区，如 Asia/Shanghai。",
+    "default": "Asia/Shanghai"
+  }
+}
