@@ -7,3 +7,4 @@ data/
 plugin_data/
 *.log
 .DS_Store
+AGENTS.md
