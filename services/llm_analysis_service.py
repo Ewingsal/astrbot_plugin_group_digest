@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from astrbot.api import logger
+
 from .models import LLMAnalysisConfig, LLMSemanticResult, MemberDigest, MessageRecord
 
 DEFAULT_ANALYSIS_PROMPT_TEMPLATE = (
@@ -79,15 +81,22 @@ class LLMAnalysisService:
         selected_messages = self._select_messages(messages, max_count=config.max_messages_for_analysis)
         messages_payload = self._build_messages_payload(selected_messages)
 
-        analysis_prompt = self._build_analysis_prompt(
-            config=config,
-            group_id=group_id,
-            date_label=date_label,
-            time_window=time_window,
-            messages_payload=messages_payload,
-            active_members=active_members,
-            max_topics=max_topics,
-        )
+        try:
+            analysis_prompt = self._build_analysis_prompt(
+                config=config,
+                group_id=group_id,
+                date_label=date_label,
+                time_window=time_window,
+                messages_payload=messages_payload,
+                active_members=active_members,
+                max_topics=max_topics,
+            )
+        except Exception as exc:
+            return LLMAnalysisOutcome(
+                error=f"语义分析提示词模板渲染失败: {exc}",
+                provider_id=provider_id,
+                provider_source=source,
+            )
 
         try:
             analysis_text = await self._llm_generate(
@@ -238,17 +247,46 @@ class LLMAnalysisService:
         active_members: list[MemberDigest],
         max_topics: int,
     ) -> str:
-        template = config.analysis_prompt_template.strip() or DEFAULT_ANALYSIS_PROMPT_TEMPLATE
+        custom_template = config.analysis_prompt_template.strip()
+        template = custom_template or DEFAULT_ANALYSIS_PROMPT_TEMPLATE
         active_member_names = [member.sender_name for member in active_members]
-        prompt = template.format(
-            group_id=group_id,
-            date_label=date_label,
-            time_window=time_window,
-            max_topics=max_topics,
-            message_count=len(messages_payload),
-            messages_json=json.dumps(messages_payload, ensure_ascii=False, indent=2),
-            active_member_names=", ".join(active_member_names),
-        )
+        template_vars = {
+            "group_id": group_id,
+            "date_label": date_label,
+            "time_window": time_window,
+            "max_topics": max_topics,
+            "message_count": len(messages_payload),
+            "messages_json": json.dumps(messages_payload, ensure_ascii=False, indent=2),
+            "active_member_names": ", ".join(active_member_names),
+        }
+
+        if custom_template:
+            try:
+                prompt = template.format(**template_vars)
+            except Exception as exc:
+                logger.warning(
+                    "[group_digest.llm] analysis_template_format_failed template_source=custom fallback=default error=%s",
+                    exc,
+                )
+                template = DEFAULT_ANALYSIS_PROMPT_TEMPLATE
+                try:
+                    prompt = template.format(**template_vars)
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "[group_digest.llm] analysis_template_format_failed template_source=default error=%s",
+                        fallback_exc,
+                    )
+                    raise ValueError(f"默认分析模板渲染失败: {fallback_exc}") from fallback_exc
+        else:
+            try:
+                prompt = template.format(**template_vars)
+            except Exception as exc:
+                logger.warning(
+                    "[group_digest.llm] analysis_template_format_failed template_source=default error=%s",
+                    exc,
+                )
+                raise ValueError(f"默认分析模板渲染失败: {exc}") from exc
+
         interaction_style_hint = config.interaction_prompt_template.strip()
         if interaction_style_hint:
             prompt = (

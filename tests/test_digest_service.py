@@ -5,11 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from services.digest_service import GroupDigestService
-from services.interaction_service import InteractionService
-from services.llm_analysis_service import LLMAnalysisService
-from services.models import LLMAnalysisConfig, MessageRecord
-from services.storage import JsonMessageStorage
+from astrbot_plugin_group_digest.services.digest_service import GroupDigestService
+from astrbot_plugin_group_digest.services.interaction_service import InteractionService
+from astrbot_plugin_group_digest.services.llm_analysis_service import LLMAnalysisService
+from astrbot_plugin_group_digest.services.models import LLMAnalysisConfig, MessageRecord
+from astrbot_plugin_group_digest.services.storage import JsonMessageStorage
 
 
 class _Resp:
@@ -211,6 +211,34 @@ def test_model_output_parse_failure_fallback(tmp_path: Path) -> None:
 
     assert "已降级为仅统计" in text
     assert "解析失败" in text or "不是合法 JSON" in text
+
+
+def test_invalid_analysis_template_fallback_to_default_template(tmp_path: Path) -> None:
+    service, storage = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "今天讨论训练计划", int(datetime(2026, 3, 22, 10, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(responses=[_valid_analysis_json()])
+    text = _run(
+        service.generate_digest_text_for_period(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 12, 0, 0),
+            period="today",
+            title_template="群聊兴趣日报（{date}）",
+            max_active_members=5,
+            max_topics=5,
+            analysis_config=_base_config(analysis_prompt_template="错误模板：{missing_field}"),
+            source="command_group_digest_today",
+        )
+    )
+
+    assert context.llm_calls
+    assert "你是一个群聊日报语义分析助手" in context.llm_calls[0][1]
+    assert "【热门话题】" in text
 
 
 def test_group_digest_and_group_digest_today_share_same_core_pipeline(tmp_path: Path) -> None:

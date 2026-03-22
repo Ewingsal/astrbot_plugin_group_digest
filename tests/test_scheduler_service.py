@@ -6,10 +6,15 @@ from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
 
-from services.digest_service import ReportBuildMetrics
-from services.group_origin_store import GroupOriginStore
-from services.models import DigestReport, LLMAnalysisConfig, LLMSemanticResult, SchedulerConfig
-from services.scheduler_service import SchedulerRuntimeOptions, ScheduledProactiveService
+from astrbot_plugin_group_digest.services.digest_service import ReportBuildMetrics
+from astrbot_plugin_group_digest.services.group_origin_store import GroupOriginStore
+from astrbot_plugin_group_digest.services.models import (
+    DigestReport,
+    LLMAnalysisConfig,
+    LLMSemanticResult,
+    SchedulerConfig,
+)
+from astrbot_plugin_group_digest.services.scheduler_service import SchedulerRuntimeOptions, ScheduledProactiveService
 
 
 class _DigestStub:
@@ -21,6 +26,8 @@ class _DigestStub:
         self.reports_by_group = reports_by_group
         self.sleep_by_group = sleep_by_group or {}
         self.calls: list[dict] = []
+        self._inflight = 0
+        self.max_inflight = 0
 
     async def build_report_for_period_with_metrics(
         self,
@@ -47,13 +54,18 @@ class _DigestStub:
                 "analysis_provider_id": analysis_config.analysis_provider_id,
             }
         )
-        sleep_seconds = float(self.sleep_by_group.get(group_id, 0.0))
-        if sleep_seconds > 0:
-            await asyncio.sleep(sleep_seconds)
-        return (
-            self.reports_by_group.get(group_id),
-            ReportBuildMetrics(load_messages_ms=1, aggregate_stats_ms=2, llm_analysis_ms=3),
-        )
+        self._inflight += 1
+        self.max_inflight = max(self.max_inflight, self._inflight)
+        try:
+            sleep_seconds = float(self.sleep_by_group.get(group_id, 0.0))
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+            return (
+                self.reports_by_group.get(group_id),
+                ReportBuildMetrics(load_messages_ms=1, aggregate_stats_ms=2, llm_analysis_ms=3),
+            )
+        finally:
+            self._inflight -= 1
 
 
 def _report(group_id: str, suggested_reply: str) -> DigestReport:
@@ -112,6 +124,7 @@ def _configure_service(
     enable: bool = False,
     whitelist_enabled: bool = False,
     whitelist: list[str] | None = None,
+    max_concurrent_groups: int = 4,
 ) -> None:
     service.start(
         scheduler_config=SchedulerConfig(
@@ -129,6 +142,7 @@ def _configure_service(
             title_template="群聊兴趣日报（{date}）",
             max_active_members=5,
             max_topics=5,
+            max_concurrent_groups=max_concurrent_groups,
         ),
     )
 
@@ -278,3 +292,35 @@ def test_scheduler_processes_groups_in_parallel(tmp_path: Path) -> None:
     # 并行时总体耗时应明显小于串行的 ~0.24s。
     assert elapsed < 0.22
     assert len(sent) == 2
+
+
+def test_scheduler_respects_max_concurrent_groups(tmp_path: Path) -> None:
+    sent: list[tuple[str, str]] = []
+    service, store, digest = _new_service(
+        tmp_path,
+        reports_by_group={
+            "group_a": _report("group_a", "A 群主动发言"),
+            "group_b": _report("group_b", "B 群主动发言"),
+            "group_c": _report("group_c", "C 群主动发言"),
+            "group_d": _report("group_d", "D 群主动发言"),
+        },
+        sleep_by_group={
+            "group_a": 0.05,
+            "group_b": 0.05,
+            "group_c": 0.05,
+            "group_d": 0.05,
+        },
+        sent=sent,
+    )
+    _configure_service(service, enable=False, max_concurrent_groups=2)
+
+    _upsert(store, group_id="group_a", unified_msg_origin="umo_a", last_active_at=111)
+    _upsert(store, group_id="group_b", unified_msg_origin="umo_b", last_active_at=222)
+    _upsert(store, group_id="group_c", unified_msg_origin="umo_c", last_active_at=333)
+    _upsert(store, group_id="group_d", unified_msg_origin="umo_d", last_active_at=444)
+
+    _run(service.run_once_for_time(datetime(2026, 3, 22, 18, 0, 0)))
+
+    assert digest.max_inflight <= 2
+    assert digest.max_inflight >= 2
+    assert len(sent) == 4

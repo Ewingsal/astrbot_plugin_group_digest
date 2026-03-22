@@ -5,12 +5,12 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from services.digest_service import GroupDigestService
-from services.interaction_service import InteractionService
-from services.llm_analysis_service import LLMAnalysisService
-from services.models import LLMAnalysisConfig, MessageRecord
-from services.report_cache_store import ReportCacheStore
-from services.storage import JsonMessageStorage
+from astrbot_plugin_group_digest.services.digest_service import GroupDigestService
+from astrbot_plugin_group_digest.services.interaction_service import InteractionService
+from astrbot_plugin_group_digest.services.llm_analysis_service import LLMAnalysisService
+from astrbot_plugin_group_digest.services.models import LLMAnalysisConfig, MessageRecord
+from astrbot_plugin_group_digest.services.report_cache_store import ReportCacheStore
+from astrbot_plugin_group_digest.services.storage import JsonMessageStorage
 
 
 class _Resp:

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from services.message_filters import (
+from astrbot_plugin_group_digest.services.message_filters import (
     classify_plugin_owned_message,
     filter_effective_messages,
     is_plugin_command_message,
     is_plugin_output_message,
 )
-from services.models import MessageRecord
+from astrbot_plugin_group_digest.services.models import MessageRecord
 
 
 def _msg(content: str, *, sender_id: str = "u1", ts: int = 1) -> MessageRecord:

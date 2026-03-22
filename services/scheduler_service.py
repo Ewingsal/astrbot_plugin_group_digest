@@ -24,6 +24,7 @@ class SchedulerRuntimeOptions:
     title_template: str
     max_active_members: int
     max_topics: int
+    max_concurrent_groups: int = 4
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class ScheduledProactiveService:
             title_template="群聊兴趣日报（{date}）",
             max_active_members=5,
             max_topics=5,
+            max_concurrent_groups=4,
         )
         self._timezone = datetime.now().astimezone().tzinfo or timezone.utc
 
@@ -98,6 +100,7 @@ class ScheduledProactiveService:
         self._analysis_config_builder = analysis_config_builder
         self._runtime_options = runtime_options
         self._timezone = self._resolve_timezone(scheduler_config.scheduled_send_timezone)
+        max_concurrent_groups = self._normalized_max_concurrent_groups(self._runtime_options.max_concurrent_groups)
 
         if not scheduler_config.enable_scheduled_proactive_message:
             logger.info("[group_digest.scheduler] disabled by config")
@@ -117,12 +120,13 @@ class ScheduledProactiveService:
             return
 
         logger.info(
-            "[group_digest.scheduler] started. time=%02d:%02d mode=%s timezone=%s whitelist_enabled=%s",
+            "[group_digest.scheduler] started. time=%02d:%02d mode=%s timezone=%s whitelist_enabled=%s max_concurrent_groups=%d",
             scheduler_config.scheduled_send_hour,
             scheduler_config.scheduled_send_minute,
             scheduler_config.scheduled_mode,
             scheduler_config.scheduled_send_timezone,
             scheduler_config.scheduled_group_whitelist_enabled,
+            max_concurrent_groups,
         )
 
     async def stop(self) -> None:
@@ -173,18 +177,21 @@ class ScheduledProactiveService:
         records = self.group_origin_store.list_group_records()
         traversed_groups = [record.group_id for record in records]
 
+        whitelist = set(config.scheduled_group_whitelist)
+        analysis_config = self._analysis_config_builder() if self._analysis_config_builder else LLMAnalysisConfig()
+        max_concurrent_groups = self._normalized_max_concurrent_groups(self._runtime_options.max_concurrent_groups)
         logger.info(
-            "[group_digest.scheduler] trigger at %s. total_groups=%d groups=%s",
+            "[group_digest.scheduler] trigger at %s. total_groups=%d groups=%s max_concurrent_groups=%d",
             trigger_time.isoformat(timespec="seconds"),
             len(records),
             traversed_groups,
+            max_concurrent_groups,
         )
-
-        whitelist = set(config.scheduled_group_whitelist)
-        analysis_config = self._analysis_config_builder() if self._analysis_config_builder else LLMAnalysisConfig()
+        semaphore = asyncio.Semaphore(max_concurrent_groups)
 
         tasks = [
-            self._process_single_group(
+            self._process_single_group_with_semaphore(
+                semaphore=semaphore,
                 record=record,
                 trigger_time=trigger_time,
                 whitelist=whitelist,
@@ -254,6 +261,25 @@ class ScheduledProactiveService:
             successful_groups=successful_groups,
             total_scheduler_ms=total_scheduler_ms,
         )
+
+    async def _process_single_group_with_semaphore(
+        self,
+        *,
+        semaphore: asyncio.Semaphore,
+        record: GroupOriginRecord,
+        trigger_time: datetime,
+        whitelist: set[str],
+        whitelist_enabled: bool,
+        analysis_config: LLMAnalysisConfig,
+    ) -> _GroupProcessResult:
+        async with semaphore:
+            return await self._process_single_group(
+                record=record,
+                trigger_time=trigger_time,
+                whitelist=whitelist,
+                whitelist_enabled=whitelist_enabled,
+                analysis_config=analysis_config,
+            )
 
     async def _process_single_group(
         self,
@@ -439,6 +465,23 @@ class ScheduledProactiveService:
 
     def _is_valid_record(self, record: GroupOriginRecord) -> bool:
         return bool(record.group_id and record.unified_msg_origin)
+
+    def _normalized_max_concurrent_groups(self, value: int) -> int:
+        try:
+            num = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[group_digest.scheduler] invalid max_concurrent_groups=%r fallback=4",
+                value,
+            )
+            num = 4
+        if num < 1:
+            logger.warning(
+                "[group_digest.scheduler] max_concurrent_groups_below_one value=%d fallback=1",
+                num,
+            )
+            return 1
+        return num
 
     async def _default_send_message(self, unified_msg_origin: str, text: str) -> None:
         sender = getattr(self.context, "send_message", None)
