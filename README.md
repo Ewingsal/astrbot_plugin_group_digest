@@ -1,112 +1,142 @@
 # astrbot_plugin_group_digest
 
-群聊兴趣日报与主动互动插件（LLM 语义分析 + 每日定时主动发言）。
+这是一个群聊兴趣日报与主动互动插件。  
+基于 AstrBot 实现群聊消息总结、群热门话题分析、成员兴趣摘要与日报生成、通过LLM 建议astrbot定时主动发言。
 
-## 当前能力
+## 功能简介
 
-- `/group_digest`：统计“昨天全天”的群聊兴趣日报。
-- `/group_digest_today`：统计“今天 00:00 到当前时刻”的群聊兴趣日报。
-- `/group_digest_debug_today`：今日底层调试统计（消息总数/参与成员/活跃榜）。
-- 每日固定时间主动发言：按群独立分析“当天 00:00 到触发时刻”，仅发送 `suggested_bot_reply`。
+这个插件主要解决两类问题：
 
-## 处理链路
+1. **命令式日报**
+   - `/group_digest`：生成昨天全天的群聊兴趣日报
+   - `/group_digest_today`：生成今天 00:00 到当前时刻的群聊兴趣日报
+   - `/group_digest_debug_today`：输出今日底层统计信息
 
-- 规则统计负责：总发言数、参与成员数、活跃成员排行、统计范围。
-- LLM 语义分析负责：热门话题、成员兴趣摘要、整体总结、建议 Bot 主动发言。
-- 定时主动发送直接复用同一日报分析链路中的 `suggested_bot_reply`，不走第二套文案逻辑。
-- 当前实现会在一次 LLM 调用中同时返回 `group_topics`、`member_interests`、`overall_summary`、`suggested_bot_reply`，减少调度耗时。
-- 日报已接入缓存池：命令与 scheduler 入口都会先查缓存，命中时直接复用，不再重复走 LLM。
+2. **定时主动互动**
+   - 支持每天固定时间自动触发
+   - 按群独立分析当天聊天内容
+   - 不发送整份日报，只发送一条适合当前群聊语境的主动发言
 
-## 日报缓存机制（MVP）
+## 核心特点
 
-- 只要日报成功生成，无论来源是命令还是 scheduler，都会写入缓存。
-- 缓存命中条件：同群、同日、同模式（`yesterday` / `today` / `scheduled`）、关键配置一致、且无新消息。
-- 若检测到有新消息或配置变化，则触发全量重算并覆盖缓存。
-- 当前版本先做“命中复用 / 失效重算”，暂不做“旧日报 + 新消息”的复杂增量更新。
-- 插件自有消息会被排除，不纳入日报统计、语义分析输入和缓存失效判断：
-- 控制命令：`/group_digest`、`/group_digest_today`、`/group_digest_debug_today`
-- 完整日报输出（默认前缀 `群聊兴趣日报（`）与调试输出前缀
-- 可识别为 bot sender 的插件自发消息（用于避免主动发言回流污染）
+- **按群隔离分析**  
+  每个群的消息、日报和主动发言都独立处理，不会串群。
 
-## LLM Provider 选择逻辑
+- **规则统计 + LLM 语义分析**  
+  规则逻辑负责发言数、活跃成员、统计范围等确定性信息；  
+  LLM 负责热门话题、成员兴趣摘要、整体总结和建议 Bot 主动发言。
 
-1. `use_llm_topic_analysis=false`：不调用 LLM，仅输出统计结果，并提示语义分析已关闭。
-2. 配置了 `analysis_provider_id`：优先使用该 provider。
-3. 未配置 `analysis_provider_id`：复用当前会话模型（`get_current_chat_provider_id(umo=event.unified_msg_origin)`）。
-4. provider 不可得或模型失败：
-- `fallback_to_stats_only=true`：降级为仅统计。
-- `fallback_to_stats_only=false`：返回清晰错误提示。
+- **多群定时主动发言**  
+  到达设定时间后，插件会对已记录的群分别生成分析结果，并向对应群发送各自的建议发言。
 
-## 定时主动发言规则
+- **日报缓存机制**  
+  同一天、同一群、同一模式下，如果没有新的有效消息，会直接复用缓存日报，减少重复分析开销。
 
-- 仅支持群聊（私聊不会进入定时主动发言范围）。
-- 必须先记录到该群的 `unified_msg_origin`，该群才会成为定时候选目标。
-- 调度触发时会遍历所有已记录群，按群独立执行：
-- 群 A 只分析群 A 消息，并发回群 A。
-- 群 B 只分析群 B 消息，并发回群 B。
-- 可选白名单：启用后仅对白名单群执行。
-- 只发送 `suggested_bot_reply`，不发送整份日报。
+- **可配置分析模型**  
+  可在插件设置中指定用于语义分析的模型；留空时默认复用 AstrBot 当前会话模型。
 
-## 存储位置
+## 日报内容
 
-默认都在 AstrBot `data` 目录下（相对路径自动拼接到 data）：
+生成的日报通常包含：
 
-- `storage_path = plugin_data/astrbot_plugin_group_digest/messages.json`
-- `group_origin_storage_path = plugin_data/astrbot_plugin_group_digest/group_origins.json`
-- `report_cache_path = plugin_data/astrbot_plugin_group_digest/report_cache.json`
+- 统计日期与统计范围
+- 总发言数
+- 参与成员数
+- 活跃成员排行
+- 热门话题
+- 成员兴趣摘要
+- 整体总结
+- 建议 Bot 主动发言
 
-可通过 `astrbot_data_dir` 显式指定 data 根目录。
+## 设计思路
 
-## 配置项（重点）
+插件整体采用“两层处理”思路：
 
-### 日报与 LLM
+### 1. 规则层
+负责确定性统计，例如：
 
-- `use_llm_topic_analysis`
-- `analysis_provider_id`
-- `analysis_prompt_template`
-- `interaction_prompt_template`
-- `max_messages_for_analysis`
-- 用于控制送入 LLM 的消息条数上限。默认 `80`，调小可降低延迟，调大可提升覆盖面。
-- `fallback_to_stats_only`
-- `report_cache_path`
+- 总发言数
+- 活跃成员排行
+- 统计时间窗口
+- 按群隔离的数据组织
 
-### 定时主动发言
+### 2. 语义层
+基于 LLM 对群聊内容进行理解，生成：
 
-- `enable_scheduled_proactive_message`：是否启用定时主动发言（默认 `false`）。
-- `scheduled_send_hour`：触发小时（默认 `18`）。
-- `scheduled_send_minute`：触发分钟（默认 `0`）。
-- `scheduled_mode`：当前仅支持 `today_until_scheduled_time`。
-- `store_group_origin`：是否记录群会话标识（默认 `true`）。
-- `scheduled_group_whitelist_enabled`：是否启用白名单（默认 `false`）。
-- `scheduled_group_whitelist`：白名单群 ID 列表。
-- `scheduled_send_timezone`：调度时区（默认 `Asia/Shanghai`）。
+- 热门话题
+- 成员兴趣摘要
+- 整体总结
+- 建议 Bot 主动发言
 
-## 快速联调（无需等到 18:00）
+这样做的好处是：
 
-1. 先启用 `enable_scheduled_proactive_message=true`。
-2. 将 `scheduled_send_hour` / `scheduled_send_minute` 改成当前时间后几分钟。
-3. 在两个测试群都发几条消息（确保插件记录各自 `unified_msg_origin`）。
-4. 观察日志：会看到遍历群列表、白名单过滤、逐群生成分析、逐群发送结果。
-5. 验证两个群收到的主动发言文案不同且不串群。
+- 数字统计更稳定
+- 语义分析更自然
+- 更适合“日报总结 + 主动互动”这种场景
 
-## 缓存联调建议
+## 定时主动发言
 
-1. 在同一群连续执行两次 `/group_digest_today`（中间不发新消息），第二次应命中 `cache_hit`。
-2. 再发一条新消息后执行 `/group_digest_today`，应出现 `cache_refresh` 并重算。
-3. 观察 scheduler 日志，确认 `source=scheduler` 的 `cache_write` 也会出现。
+插件支持每天固定时间自动发言。
 
-## 依赖与测试
+行为规则如下：
 
-- `requirements.txt`：运行时依赖（当前无额外第三方依赖）。
-- `requirements-dev.txt`：开发与测试依赖（pytest）。
+- 仅支持群聊
+- 每个群独立生成自己的分析结果
+- 每个群只会收到属于自己的主动发言
+- 主动发言内容来自日报分析中的 `suggested_bot_reply`
+- 支持白名单群配置
 
-```bash
-python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q
-```
+这个能力适合让 Bot 在固定时间点自然参与群聊，而不仅仅是被动响应命令。
 
-## AstrBot API 适配说明
+## 缓存机制
 
-- 主动发送基于官方能力：`self.context.send_message(unified_msg_origin, chain)`。
-- 定时任务基于官方建议：在插件 `__init__` 中用 `asyncio.create_task(...)` 启动后台任务。
-- 若 AstrBot 后续调整接口签名，请在 `services/scheduler_service.py` 的发送适配层更新（已保留 TODO）。
+为了减少重复分析开销，插件内置了日报缓存：
+
+- 日报成功生成后会写入缓存
+- 命令触发和定时任务触发都会复用同一套缓存机制
+- 如果没有新的有效消息，则直接命中缓存
+- 如果有新的有效消息，则重新生成并刷新缓存
+
+## 支持的配置项
+
+插件支持通过 AstrBot 配置项进行调整，主要包括：
+
+- 是否启用 LLM 语义分析
+- 指定分析模型 provider
+- LLM 分析提示词模板
+- 最大分析消息条数
+- 是否仅在统计模式下回退
+- 是否启用定时主动发言
+- 定时触发时间
+- 调度时区
+- 是否启用群白名单
+- 白名单群列表
+
+## 存储说明
+
+插件运行时数据默认存放在 AstrBot `data` 目录下，包括：
+
+- 群消息归档
+- 群会话标识映射
+- 日报缓存
+
+## 适用场景
+
+这个插件适合：
+
+- 想快速了解某个群过去一天主要聊了什么
+- 想观察群成员最近关注的话题
+- 想让 Bot 在固定时间自然参与讨论
+- 想把群聊总结和主动互动做成自动化能力
+
+## 项目定位
+
+这不是一个单纯的“关键词统计插件”，而是一个面向群聊场景的：
+
+**日报生成 + 语义分析 + 主动互动**
+
+一体化插件。
+
+## 许可证
+
+本项目采用 **GNU AGPL v3** 许可证。
