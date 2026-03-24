@@ -31,6 +31,28 @@ DEFAULT_ANALYSIS_PROMPT_TEMPLATE = (
     "}}"
 )
 
+DEFAULT_INCREMENTAL_ANALYSIS_PROMPT_TEMPLATE = (
+    "你是一个群聊日报语义分析助手。你将基于“上一版语义状态 + 新增消息”生成最新版完整 JSON。\\n"
+    "统计日期：{date_label}\\n"
+    "统计范围：{time_window}\\n"
+    "群组：{group_id}\\n"
+    "上一版语义状态（JSON）：\\n{previous_semantic_json}\\n\\n"
+    "新增消息（JSON 数组）：\\n{delta_messages_json}\\n\\n"
+    "更新后的规则统计（JSON）：\\n{stats_state_json}\\n\\n"
+    "要求：\\n"
+    "1. 输出必须是 JSON 对象，不要输出额外解释。\\n"
+    "2. 输出字段必须包含 group_topics、member_interests、overall_summary、suggested_bot_reply。\\n"
+    "3. 基于旧状态保持语义连续性，并吸收新增消息变化。\\n"
+    "4. suggested_bot_reply 要自然、友好、可直接发到群里，长度 1-2 句。\\n\\n"
+    "JSON Schema（字段名必须一致）：\\n"
+    "{{\\n"
+    "  \"group_topics\": [\"话题1\", \"话题2\"],\\n"
+    "  \"member_interests\": {{\"成员A\": \"兴趣摘要\", \"成员B\": \"兴趣摘要\"}},\\n"
+    "  \"overall_summary\": \"整体总结\",\\n"
+    "  \"suggested_bot_reply\": \"建议 Bot 主动发言\"\\n"
+    "}}"
+)
+
 
 @dataclass
 class LLMAnalysisOutcome:
@@ -109,6 +131,93 @@ class LLMAnalysisService:
         except Exception as exc:
             return LLMAnalysisOutcome(
                 error=f"语义分析模型调用或解析失败: {exc}",
+                provider_id=provider_id,
+                provider_source=source,
+            )
+
+        semantic = LLMSemanticResult(
+            group_topics=parsed["group_topics"],
+            member_interests=parsed["member_interests"],
+            overall_summary=parsed["overall_summary"],
+            suggested_bot_reply=parsed["suggested_bot_reply"],
+        )
+        return LLMAnalysisOutcome(
+            semantic=semantic,
+            notice=f"语义分析模型：{provider_id}（{source}）",
+            provider_id=provider_id,
+            provider_source=source,
+        )
+
+    async def analyze_incremental(
+        self,
+        *,
+        context: Any,
+        event: Any,
+        config: LLMAnalysisConfig,
+        group_id: str,
+        date_label: str,
+        time_window: str,
+        delta_messages: list[MessageRecord],
+        previous_semantic_state: dict[str, Any],
+        updated_stats_state: dict[str, Any],
+        max_topics: int,
+        resolved_provider_id: str | None = None,
+        resolved_provider_source: str = "",
+    ) -> LLMAnalysisOutcome:
+        if not config.use_llm_topic_analysis:
+            return LLMAnalysisOutcome(notice="语义分析已关闭（use_llm_topic_analysis=false）。")
+
+        if resolved_provider_id is not None:
+            provider_id = str(resolved_provider_id).strip()
+            if config.analysis_provider_id.strip():
+                source = "configured"
+            else:
+                source = resolved_provider_source or "session"
+            provider_err = "" if provider_id else "未找到可用的分析模型 provider。"
+        else:
+            provider_id, source, provider_err = await self._resolve_provider_id(
+                context=context,
+                event=event,
+                configured_provider_id=config.analysis_provider_id,
+            )
+        if not provider_id:
+            return LLMAnalysisOutcome(error=provider_err or "未找到可用的分析模型 provider。")
+
+        selected_delta_messages = self._select_messages(
+            delta_messages,
+            max_count=config.max_messages_for_analysis,
+        )
+        delta_payload = self._build_messages_payload(selected_delta_messages)
+
+        try:
+            prompt = self._build_incremental_analysis_prompt(
+                config=config,
+                group_id=group_id,
+                date_label=date_label,
+                time_window=time_window,
+                delta_messages_payload=delta_payload,
+                previous_semantic_state=previous_semantic_state,
+                updated_stats_state=updated_stats_state,
+                max_topics=max_topics,
+            )
+        except Exception as exc:
+            return LLMAnalysisOutcome(
+                error=f"增量语义分析提示词模板渲染失败: {exc}",
+                provider_id=provider_id,
+                provider_source=source,
+            )
+
+        try:
+            analysis_text = await self._llm_generate(
+                context=context,
+                provider_id=provider_id,
+                prompt=prompt,
+            )
+            analysis_obj = self._parse_json_object(analysis_text)
+            parsed = self._parse_unified_object(analysis_obj)
+        except Exception as exc:
+            return LLMAnalysisOutcome(
+                error=f"增量语义分析模型调用或解析失败: {exc}",
                 provider_id=provider_id,
                 provider_source=source,
             )
@@ -286,6 +395,48 @@ class LLMAnalysisService:
                     exc,
                 )
                 raise ValueError(f"默认分析模板渲染失败: {exc}") from exc
+
+        interaction_style_hint = config.interaction_prompt_template.strip()
+        if interaction_style_hint:
+            prompt = (
+                f"{prompt}\n\n"
+                "补充风格要求（可选参考）：\n"
+                f"{interaction_style_hint}\n\n"
+                "注意：最终仍需输出同一个 JSON 对象，并包含 suggested_bot_reply 字段。"
+            )
+        return prompt
+
+    def _build_incremental_analysis_prompt(
+        self,
+        *,
+        config: LLMAnalysisConfig,
+        group_id: str,
+        date_label: str,
+        time_window: str,
+        delta_messages_payload: list[dict[str, Any]],
+        previous_semantic_state: dict[str, Any],
+        updated_stats_state: dict[str, Any],
+        max_topics: int,
+    ) -> str:
+        template = DEFAULT_INCREMENTAL_ANALYSIS_PROMPT_TEMPLATE
+        template_vars = {
+            "group_id": group_id,
+            "date_label": date_label,
+            "time_window": time_window,
+            "max_topics": max_topics,
+            "delta_messages_count": len(delta_messages_payload),
+            "delta_messages_json": json.dumps(delta_messages_payload, ensure_ascii=False, indent=2),
+            "previous_semantic_json": json.dumps(previous_semantic_state, ensure_ascii=False, indent=2),
+            "stats_state_json": json.dumps(updated_stats_state, ensure_ascii=False, indent=2),
+        }
+        try:
+            prompt = template.format(**template_vars)
+        except Exception as exc:
+            logger.warning(
+                "[group_digest.llm] incremental_template_format_failed template_source=default error=%s",
+                exc,
+            )
+            raise ValueError(f"默认增量分析模板渲染失败: {exc}") from exc
 
         interaction_style_hint = config.interaction_prompt_template.strip()
         if interaction_style_hint:

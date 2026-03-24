@@ -324,6 +324,7 @@ class GroupDigestPlugin(Star):
             sender_name=sender_name,
             content=content,
             timestamp=timestamp,
+            message_id=self._extract_message_id(event),
         )
         await self.storage.append_message(record)
 
@@ -429,6 +430,30 @@ class GroupDigestPlugin(Star):
             return int(ts)
         except (TypeError, ValueError):
             return int(datetime.now().timestamp())
+
+    def _extract_message_id(self, event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        for attr in ("message_id", "msg_id", "id"):
+            value = getattr(message_obj, attr, None)
+            if value:
+                return str(value)
+
+        for attr in ("message_id", "msg_id", "id"):
+            value = getattr(event, attr, None)
+            if value:
+                return str(value)
+
+        getter = getattr(event, "get_message_id", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value:
+                    return str(value)
+            except Exception:
+                # TODO: 确认不同 AstrBot 版本 get_message_id 的行为。
+                pass
+
+        return ""
 
     def _extract_message_text(self, event: AstrMessageEvent) -> str:
         text = getattr(event, "message_str", "")

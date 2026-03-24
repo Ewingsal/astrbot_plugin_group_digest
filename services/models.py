@@ -13,6 +13,7 @@ class MessageRecord:
     sender_name: str
     content: str
     timestamp: int
+    message_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -33,6 +34,7 @@ class MessageRecord:
             sender_name=str(data.get("sender_name", "未知成员")),
             content=str(data.get("content", "")),
             timestamp=timestamp,
+            message_id=str(data.get("message_id", "")),
         )
 
     @staticmethod

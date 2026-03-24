@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,12 @@ class ReportCacheRecord:
     cache_version: int
     source: str
     report: dict[str, Any]
+    effective_message_count: int = 0
+    effective_last_message_ts: int = 0
+    effective_last_message_fingerprint: str = ""
+    stats_state: dict[str, Any] = field(default_factory=dict)
+    semantic_state: dict[str, Any] = field(default_factory=dict)
+    incremental_round: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -43,6 +49,28 @@ class ReportCacheRecord:
             )
             report_payload = {}
 
+        stats_state = data.get("stats_state", {})
+        if not isinstance(stats_state, dict):
+            logger.warning(
+                "[group_digest.cache_store] invalid_stats_state_type expected=dict got=%s",
+                type(stats_state).__name__,
+            )
+            stats_state = {}
+
+        semantic_state = data.get("semantic_state", {})
+        if not isinstance(semantic_state, dict):
+            logger.warning(
+                "[group_digest.cache_store] invalid_semantic_state_type expected=dict got=%s",
+                type(semantic_state).__name__,
+            )
+            semantic_state = {}
+
+        legacy_last_ts = cls._safe_int(
+            data.get("last_message_timestamp", 0),
+            field="last_message_timestamp",
+        )
+        legacy_count = cls._safe_int(data.get("message_count", 0), field="message_count")
+
         return cls(
             group_id=str(data.get("group_id", "")),
             date=str(data.get("date", "")),
@@ -50,11 +78,8 @@ class ReportCacheRecord:
             window_start=cls._safe_int(data.get("window_start", 0), field="window_start"),
             window_end=cls._safe_int(data.get("window_end", 0), field="window_end"),
             generated_at=str(data.get("generated_at", "")),
-            last_message_timestamp=cls._safe_int(
-                data.get("last_message_timestamp", 0),
-                field="last_message_timestamp",
-            ),
-            message_count=cls._safe_int(data.get("message_count", 0), field="message_count"),
+            last_message_timestamp=legacy_last_ts,
+            message_count=legacy_count,
             provider_id=str(data.get("provider_id", "")),
             analysis_provider_notice=str(data.get("analysis_provider_notice", "")),
             max_messages_for_analysis=cls._safe_int(
@@ -65,6 +90,18 @@ class ReportCacheRecord:
             cache_version=cls._safe_int(data.get("cache_version", 0), field="cache_version"),
             source=str(data.get("source", "")),
             report=report_payload,
+            effective_message_count=cls._safe_int(
+                data.get("effective_message_count", legacy_count),
+                field="effective_message_count",
+            ),
+            effective_last_message_ts=cls._safe_int(
+                data.get("effective_last_message_ts", legacy_last_ts),
+                field="effective_last_message_ts",
+            ),
+            effective_last_message_fingerprint=str(data.get("effective_last_message_fingerprint", "")),
+            stats_state=stats_state,
+            semantic_state=semantic_state,
+            incremental_round=cls._safe_int(data.get("incremental_round", 0), field="incremental_round"),
         )
 
     @staticmethod

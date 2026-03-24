@@ -11,8 +11,9 @@ from typing import Any, Literal
 from astrbot.api import logger
 
 from .interaction_service import InteractionService
+from .incremental_update_service import EffectiveMessageState, IncrementalUpdateService
 from .llm_analysis_service import LLMAnalysisService
-from .message_filters import effective_message_stats, filter_effective_messages
+from .message_filters import filter_effective_messages
 from .models import DigestReport, LLMAnalysisConfig, LLMSemanticResult, MemberDigest, MessageRecord
 from .report_cache_store import ReportCacheRecord, ReportCacheStore
 from .storage import JsonMessageStorage
@@ -35,9 +36,25 @@ class ReportBuildMetrics:
     load_messages_ms: int
     aggregate_stats_ms: int
     llm_analysis_ms: int
+    build_path: str = "full_rebuild"
+    delta_message_count: int = 0
+    incremental_round: int = 0
+
+
+@dataclass(frozen=True)
+class CacheDecision:
+    strategy: Literal["cache_hit", "incremental_update", "full_rebuild"]
+    reason: str
+    delta_messages: list[MessageRecord]
+    incremental_round: int = 0
 
 
 class GroupDigestService:
+    INCREMENTAL_SUPPORTED_MODES = {"today", "scheduled"}
+    INCREMENTAL_MAX_DELTA_MESSAGES = 20
+    INCREMENTAL_MAX_DELTA_RATIO = 0.5
+    INCREMENTAL_MAX_ROUNDS = 3
+
     def __init__(
         self,
         storage: JsonMessageStorage,
@@ -53,6 +70,7 @@ class GroupDigestService:
         self.template_path = template_path
         self.report_cache_store = report_cache_store
         self.cache_version = int(cache_version)
+        self.incremental_service = IncrementalUpdateService()
 
     async def generate_digest_text_for_period(
         self,
@@ -153,7 +171,11 @@ class GroupDigestService:
         )
         load_messages_ms = int((perf_counter() - load_start) * 1000)
         effective_messages, excluded_reasons = filter_effective_messages(raw_messages)
-        message_count, last_message_ts = effective_message_stats(effective_messages)
+        ordered_effective_messages = self.incremental_service.sort_messages(effective_messages)
+        effective_state = self.incremental_service.build_effective_state(ordered_effective_messages)
+        message_count = effective_state.message_count
+        last_message_ts = effective_state.last_message_ts
+        last_message_fingerprint = effective_state.last_message_fingerprint
         excluded_total = sum(excluded_reasons.values())
         if excluded_total:
             logger.info(
@@ -185,77 +207,148 @@ class GroupDigestService:
             config=config,
         )
 
+        cache_record: ReportCacheRecord | None = None
+        full_rebuild_reason = "no_cache_store"
+        fallback_from_incremental = False
+
         if self.report_cache_store is not None:
             cache_record = self.report_cache_store.get_record(
                 group_id=group_id,
                 date=window.date_label,
                 mode=cache_mode,
             )
-            cache_miss_reason = "no_cache_entry"
-            if cache_record is not None:
-                cache_miss_reason = self._validate_cache_record(
-                    cache_record=cache_record,
-                    current_message_count=message_count,
-                    current_last_message_ts=last_message_ts,
-                    expected_provider_id=expected_provider_id,
-                    expected_provider_err=expected_provider_err,
-                    max_messages_for_analysis=config.max_messages_for_analysis,
-                    prompt_signature=prompt_signature,
-                    window_start=window.start_ts,
-                )
-                if not cache_miss_reason:
-                    cached_report = self._report_from_payload(cache_record.report)
-                    if cached_report is not None:
-                        logger.info(
-                            "[group_digest.cache] cache_hit group_id=%s date=%s mode=%s reason=no_new_messages_and_config_stable effective_message_count=%s effective_last_message_ts=%s",
-                            group_id,
-                            window.date_label,
-                            cache_mode,
-                            message_count,
-                            last_message_ts,
-                        )
-                        return (
-                            cached_report,
-                            ReportBuildMetrics(
-                                load_messages_ms=load_messages_ms,
-                                aggregate_stats_ms=0,
-                                llm_analysis_ms=0,
-                            ),
-                        )
-                    cache_miss_reason = "cached_report_invalid"
+            decision = self._decide_cache_strategy(
+                cache_record=cache_record,
+                cache_mode=cache_mode,
+                effective_messages=ordered_effective_messages,
+                effective_state=effective_state,
+                expected_provider_id=expected_provider_id,
+                expected_provider_err=expected_provider_err,
+                max_messages_for_analysis=config.max_messages_for_analysis,
+                prompt_signature=prompt_signature,
+                window_start=window.start_ts,
+                use_llm_topic_analysis=config.use_llm_topic_analysis,
+            )
 
-            if cache_miss_reason == "no_cache_entry":
-                logger.info(
-                    "[group_digest.cache] cache_miss group_id=%s date=%s mode=%s reason=%s effective_message_count=%s effective_last_message_ts=%s",
+            if decision.strategy == "cache_hit" and cache_record is not None:
+                cached_report = self._report_from_payload(cache_record.report)
+                if cached_report is not None:
+                    logger.info(
+                        "[group_digest.cache] cache_hit group_id=%s date=%s mode=%s reason=%s effective_message_count=%s effective_last_message_ts=%s effective_last_message_fingerprint=%s provider=%s",
+                        group_id,
+                        window.date_label,
+                        cache_mode,
+                        decision.reason,
+                        message_count,
+                        last_message_ts,
+                        last_message_fingerprint,
+                        expected_provider_id or "-",
+                    )
+                    return (
+                        cached_report,
+                        ReportBuildMetrics(
+                            load_messages_ms=load_messages_ms,
+                            aggregate_stats_ms=0,
+                            llm_analysis_ms=0,
+                            build_path="cache_hit",
+                            delta_message_count=0,
+                            incremental_round=max(0, cache_record.incremental_round),
+                        ),
+                    )
+                logger.warning(
+                    "[group_digest.cache] cached_report_invalid group_id=%s date=%s mode=%s fallback_to_full_rebuild=true",
                     group_id,
                     window.date_label,
                     cache_mode,
-                    cache_miss_reason,
-                    message_count,
-                    last_message_ts,
                 )
-            elif cache_miss_reason in {"new_messages_detected", "provider_changed", "max_messages_changed", "prompt_signature_changed"}:
+                full_rebuild_reason = "cached_report_invalid"
+            elif decision.strategy == "incremental_update" and cache_record is not None:
                 logger.info(
-                    "[group_digest.cache] cache_refresh group_id=%s date=%s mode=%s reason=%s effective_message_count=%s effective_last_message_ts=%s",
+                    "[group_digest.cache] incremental_update group_id=%s date=%s mode=%s reason=%s delta_message_count=%d effective_message_count=%d incremental_round=%d provider=%s",
                     group_id,
                     window.date_label,
                     cache_mode,
-                    cache_miss_reason,
+                    decision.reason,
+                    len(decision.delta_messages),
                     message_count,
-                    last_message_ts,
+                    decision.incremental_round,
+                    expected_provider_id or "-",
                 )
+                try:
+                    incremental_result = await self._build_report_with_incremental_update(
+                        context=context,
+                        event=event,
+                        group_id=group_id,
+                        window=window,
+                        period=period,
+                        max_active_members=max_active_members,
+                        max_topics=max_topics,
+                        analysis_config=config,
+                        expected_provider_id=expected_provider_id,
+                        expected_provider_source=expected_provider_source,
+                        cache_record=cache_record,
+                        delta_messages=decision.delta_messages,
+                        load_messages_ms=load_messages_ms,
+                        incremental_round=decision.incremental_round,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[group_digest.cache] incremental_update_exception group_id=%s date=%s mode=%s error=%s",
+                        group_id,
+                        window.date_label,
+                        cache_mode,
+                        exc,
+                    )
+                    incremental_result = None
+                if incremental_result is not None:
+                    report, metrics, updated_stats_state, updated_semantic_state = incremental_result
+                    if report is not None:
+                        await self._write_cache_record(
+                            report=report,
+                            cache_mode=cache_mode,
+                            group_id=group_id,
+                            window=window,
+                            source=source,
+                            config=config,
+                            prompt_signature=prompt_signature,
+                            provider_id=report.analysis_provider_id or expected_provider_id,
+                            effective_state=effective_state,
+                            stats_state=updated_stats_state,
+                            semantic_state=updated_semantic_state,
+                            incremental_round=decision.incremental_round,
+                        )
+                    return report, metrics
+
+                full_rebuild_reason = "incremental_update_failed"
+                fallback_from_incremental = True
             else:
-                logger.info(
-                    "[group_digest.cache] cache_miss group_id=%s date=%s mode=%s reason=%s effective_message_count=%s effective_last_message_ts=%s",
-                    group_id,
-                    window.date_label,
-                    cache_mode,
-                    cache_miss_reason,
-                    message_count,
-                    last_message_ts,
-                )
+                full_rebuild_reason = decision.reason
 
-        report, metrics, rebuilt_count, rebuilt_last_ts = await self._build_report_without_cache(
+            logger.info(
+                "[group_digest.cache] full_rebuild group_id=%s date=%s mode=%s reason=%s delta_message_count=%d effective_message_count=%d incremental_round=%d provider=%s whether_fallback_to_full_rebuild=%s",
+                group_id,
+                window.date_label,
+                cache_mode,
+                full_rebuild_reason,
+                len(decision.delta_messages),
+                message_count,
+                decision.incremental_round,
+                expected_provider_id or "-",
+                "true" if fallback_from_incremental else "false",
+            )
+        else:
+            logger.info(
+                "[group_digest.cache] full_rebuild group_id=%s date=%s mode=%s reason=%s delta_message_count=%d effective_message_count=%d incremental_round=0 provider=%s whether_fallback_to_full_rebuild=false",
+                group_id,
+                window.date_label,
+                cache_mode,
+                full_rebuild_reason,
+                0,
+                message_count,
+                expected_provider_id or "-",
+            )
+
+        report, metrics, rebuilt_stats_state, rebuilt_semantic_state = await self._build_report_without_cache(
             context=context,
             event=event,
             group_id=group_id,
@@ -266,37 +359,24 @@ class GroupDigestService:
             analysis_config=config,
             expected_provider_id=expected_provider_id,
             expected_provider_source=expected_provider_source,
-            effective_messages=effective_messages,
+            effective_messages=ordered_effective_messages,
             load_messages_ms=load_messages_ms,
         )
 
         if report is not None and self.report_cache_store is not None:
-            cache_provider_id = report.analysis_provider_id or expected_provider_id
-            record = ReportCacheRecord(
+            await self._write_cache_record(
+                report=report,
+                cache_mode=cache_mode,
                 group_id=group_id,
-                date=window.date_label,
-                mode=cache_mode,
-                window_start=window.start_ts,
-                window_end=window.end_ts,
-                generated_at=datetime.now().isoformat(timespec="seconds"),
-                last_message_timestamp=rebuilt_last_ts,
-                message_count=rebuilt_count,
-                provider_id=cache_provider_id,
-                analysis_provider_notice=report.analysis_notice,
-                max_messages_for_analysis=config.max_messages_for_analysis,
-                prompt_signature=prompt_signature,
-                cache_version=self.cache_version,
+                window=window,
                 source=source,
-                report=self._report_to_payload(report),
-            )
-            await self.report_cache_store.upsert_record(record)
-            logger.info(
-                "[group_digest.cache] cache_write group_id=%s date=%s mode=%s source=%s message_count=%s",
-                group_id,
-                window.date_label,
-                cache_mode,
-                source,
-                rebuilt_count,
+                config=config,
+                prompt_signature=prompt_signature,
+                provider_id=report.analysis_provider_id or expected_provider_id,
+                effective_state=effective_state,
+                stats_state=rebuilt_stats_state,
+                semantic_state=rebuilt_semantic_state,
+                incremental_round=0,
             )
 
         return report, metrics
@@ -316,7 +396,7 @@ class GroupDigestService:
         expected_provider_source: str,
         effective_messages: list[MessageRecord],
         load_messages_ms: int,
-    ) -> tuple[DigestReport | None, ReportBuildMetrics, int, int]:
+    ) -> tuple[DigestReport | None, ReportBuildMetrics, dict[str, Any], dict[str, Any]]:
         if not effective_messages:
             return (
                 None,
@@ -324,17 +404,19 @@ class GroupDigestService:
                     load_messages_ms=load_messages_ms,
                     aggregate_stats_ms=0,
                     llm_analysis_ms=0,
+                    build_path="no_messages",
                 ),
-                0,
-                0,
+                {},
+                {},
             )
 
         aggregate_start = perf_counter()
-        report = self._build_stats_report(
+        stats_state = self.incremental_service.build_stats_state_from_messages(effective_messages)
+        report = self._build_stats_report_from_state(
             period=period,
             group_id=group_id,
             window=window,
-            messages=effective_messages,
+            stats_state=stats_state,
             max_active_members=max_active_members,
         )
         aggregate_stats_ms = int((perf_counter() - aggregate_start) * 1000)
@@ -355,26 +437,11 @@ class GroupDigestService:
         )
         llm_analysis_ms = int((perf_counter() - llm_start) * 1000)
 
-        if outcome.semantic is not None:
-            outcome.semantic.suggested_bot_reply = self.interaction_service.finalize_suggested_reply(
-                outcome.semantic.suggested_bot_reply
-            )
-            report.llm_semantic = outcome.semantic
-            report.stats_only = False
-            report.analysis_notice = outcome.notice
-            report.analysis_provider_id = outcome.provider_id
-        elif outcome.error:
-            report.analysis_provider_id = outcome.provider_id
-            if analysis_config.fallback_to_stats_only:
-                report.stats_only = True
-                report.analysis_notice = f"语义分析失败，已降级为仅统计：{outcome.error}"
-            else:
-                report.stats_only = True
-                report.analysis_notice = f"[ERROR] 语义分析失败：{outcome.error}"
-        else:
-            report.stats_only = True
-            report.analysis_notice = outcome.notice or "语义分析已关闭，当前仅展示统计结果。"
-            report.analysis_provider_id = outcome.provider_id
+        semantic_state = self._apply_analysis_outcome_to_report(
+            report=report,
+            outcome=outcome,
+            analysis_config=analysis_config,
+        )
 
         return (
             report,
@@ -382,9 +449,10 @@ class GroupDigestService:
                 load_messages_ms=load_messages_ms,
                 aggregate_stats_ms=aggregate_stats_ms,
                 llm_analysis_ms=llm_analysis_ms,
+                build_path="full_rebuild",
             ),
-            len(effective_messages),
-            max((row.timestamp for row in effective_messages), default=0),
+            stats_state,
+            semantic_state,
         )
 
     async def _resolve_expected_provider_id(
@@ -406,35 +474,345 @@ class GroupDigestService:
             return provider_id, source, ""
         return "", "", error or "provider_unavailable"
 
-    def _validate_cache_record(
+    def _decide_cache_strategy(
         self,
         *,
-        cache_record: ReportCacheRecord,
-        current_message_count: int,
-        current_last_message_ts: int,
+        cache_record: ReportCacheRecord | None,
+        cache_mode: ReportMode,
+        effective_messages: list[MessageRecord],
+        effective_state: EffectiveMessageState,
         expected_provider_id: str,
         expected_provider_err: str,
         max_messages_for_analysis: int,
         prompt_signature: str,
         window_start: int,
-    ) -> str:
+        use_llm_topic_analysis: bool,
+    ) -> CacheDecision:
+        if cache_record is None:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="no_cache_entry",
+                delta_messages=[],
+                incremental_round=0,
+            )
+
         if cache_record.cache_version != self.cache_version:
-            return "cache_version_changed"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="cache_version_changed",
+                delta_messages=[],
+                incremental_round=0,
+            )
         if cache_record.window_start != window_start:
-            return "window_changed"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="window_changed",
+                delta_messages=[],
+                incremental_round=0,
+            )
         if cache_record.max_messages_for_analysis != max_messages_for_analysis:
-            return "max_messages_changed"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="max_messages_changed",
+                delta_messages=[],
+                incremental_round=0,
+            )
         if cache_record.prompt_signature != prompt_signature:
-            return "prompt_signature_changed"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="prompt_signature_changed",
+                delta_messages=[],
+                incremental_round=0,
+            )
         if expected_provider_err:
-            return "provider_validation_failed"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="provider_validation_failed",
+                delta_messages=[],
+                incremental_round=0,
+            )
         if expected_provider_id and cache_record.provider_id != expected_provider_id:
-            return "provider_changed"
-        if cache_record.message_count != current_message_count:
-            return "new_messages_detected"
-        if cache_record.last_message_timestamp != current_last_message_ts:
-            return "new_messages_detected"
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="provider_changed",
+                delta_messages=[],
+                incremental_round=0,
+            )
+
+        cached_effective_count = self._cached_effective_count(cache_record)
+        cached_effective_last_ts = self._cached_effective_last_ts(cache_record)
+        cached_effective_last_fingerprint = self._cached_effective_last_fingerprint(cache_record)
+
+        if (
+            cached_effective_count == effective_state.message_count
+            and cached_effective_last_ts == effective_state.last_message_ts
+            and cached_effective_last_fingerprint == effective_state.last_message_fingerprint
+        ):
+            return CacheDecision(
+                strategy="cache_hit",
+                reason="no_new_effective_messages",
+                delta_messages=[],
+                incremental_round=max(0, cache_record.incremental_round),
+            )
+
+        if cache_mode not in self.INCREMENTAL_SUPPORTED_MODES:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="mode_not_incremental",
+                delta_messages=[],
+                incremental_round=0,
+            )
+
+        if effective_state.message_count < cached_effective_count:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="effective_message_count_decreased",
+                delta_messages=[],
+                incremental_round=0,
+            )
+
+        boundary_reason, delta_messages = self.incremental_service.locate_delta_messages(
+            messages=effective_messages,
+            checkpoint_last_message_ts=cached_effective_last_ts,
+            checkpoint_last_message_fingerprint=cached_effective_last_fingerprint,
+        )
+        if boundary_reason:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason=boundary_reason,
+                delta_messages=[],
+                incremental_round=0,
+            )
+
+        delta_count = len(delta_messages)
+        if delta_count <= 0:
+            return CacheDecision(
+                strategy="cache_hit",
+                reason="no_new_effective_messages",
+                delta_messages=[],
+                incremental_round=max(0, cache_record.incremental_round),
+            )
+
+        if delta_count > self.INCREMENTAL_MAX_DELTA_MESSAGES:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="delta_messages_too_many",
+                delta_messages=delta_messages,
+                incremental_round=0,
+            )
+
+        delta_ratio = delta_count / max(1, effective_state.message_count)
+        if delta_ratio > self.INCREMENTAL_MAX_DELTA_RATIO:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="delta_ratio_too_high",
+                delta_messages=delta_messages,
+                incremental_round=0,
+            )
+
+        next_incremental_round = max(0, cache_record.incremental_round) + 1
+        if next_incremental_round > self.INCREMENTAL_MAX_ROUNDS:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="incremental_round_limit_exceeded",
+                delta_messages=delta_messages,
+                incremental_round=next_incremental_round,
+            )
+
+        if self.incremental_service.normalize_stats_state(cache_record.stats_state) is None:
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="checkpoint_stats_state_invalid",
+                delta_messages=delta_messages,
+                incremental_round=next_incremental_round,
+            )
+
+        # 语义分析开启时，增量语义更新需要上一版语义状态。
+        if use_llm_topic_analysis and not self._semantic_state_from_cache(cache_record):
+            return CacheDecision(
+                strategy="full_rebuild",
+                reason="checkpoint_semantic_state_missing",
+                delta_messages=delta_messages,
+                incremental_round=next_incremental_round,
+            )
+
+        return CacheDecision(
+            strategy="incremental_update",
+            reason="new_effective_messages_detected",
+            delta_messages=delta_messages,
+            incremental_round=next_incremental_round,
+        )
+
+    def _cached_effective_count(self, cache_record: ReportCacheRecord) -> int:
+        value = self._safe_int(
+            cache_record.effective_message_count,
+            field="cache.effective_message_count",
+            default=cache_record.message_count,
+        )
+        if value < 0:
+            return 0
+        return value
+
+    def _cached_effective_last_ts(self, cache_record: ReportCacheRecord) -> int:
+        value = self._safe_int(
+            cache_record.effective_last_message_ts,
+            field="cache.effective_last_message_ts",
+            default=cache_record.last_message_timestamp,
+        )
+        if value < 0:
+            return 0
+        return value
+
+    def _cached_effective_last_fingerprint(self, cache_record: ReportCacheRecord) -> str:
+        value = str(cache_record.effective_last_message_fingerprint or "").strip()
+        if value:
+            return value
+
+        # 兼容旧缓存：如果没有 fingerprint，保守回退全量重算。
         return ""
+
+    async def _build_report_with_incremental_update(
+        self,
+        *,
+        context: Any,
+        event: Any,
+        group_id: str,
+        window: ReportWindow,
+        period: PeriodType,
+        max_active_members: int,
+        max_topics: int,
+        analysis_config: LLMAnalysisConfig,
+        expected_provider_id: str,
+        expected_provider_source: str,
+        cache_record: ReportCacheRecord,
+        delta_messages: list[MessageRecord],
+        load_messages_ms: int,
+        incremental_round: int,
+    ) -> tuple[DigestReport, ReportBuildMetrics, dict[str, Any], dict[str, Any]] | None:
+        aggregate_start = perf_counter()
+        updated_stats_state = self.incremental_service.apply_delta_to_stats_state(
+            base_state=cache_record.stats_state,
+            delta_messages=delta_messages,
+        )
+        if updated_stats_state is None:
+            logger.warning(
+                "[group_digest.cache] incremental_update_failed group_id=%s date=%s mode=%s reason=invalid_stats_state",
+                group_id,
+                window.date_label,
+                cache_record.mode,
+            )
+            return None
+
+        report = self._build_stats_report_from_state(
+            period=period,
+            group_id=group_id,
+            window=window,
+            stats_state=updated_stats_state,
+            max_active_members=max_active_members,
+        )
+        aggregate_stats_ms = int((perf_counter() - aggregate_start) * 1000)
+
+        previous_semantic_state = self._semantic_state_from_cache(cache_record)
+        llm_start = perf_counter()
+        outcome = await self.llm_analysis_service.analyze_incremental(
+            context=context,
+            event=event,
+            config=analysis_config,
+            group_id=group_id,
+            date_label=window.date_label,
+            time_window=window.time_window,
+            delta_messages=delta_messages,
+            previous_semantic_state=previous_semantic_state,
+            updated_stats_state=updated_stats_state,
+            max_topics=max_topics,
+            resolved_provider_id=expected_provider_id if expected_provider_id else None,
+            resolved_provider_source=expected_provider_source,
+        )
+        llm_analysis_ms = int((perf_counter() - llm_start) * 1000)
+
+        if outcome.error:
+            logger.warning(
+                "[group_digest.cache] incremental_update_failed group_id=%s date=%s mode=%s reason=llm_incremental_failed error=%s",
+                group_id,
+                window.date_label,
+                cache_record.mode,
+                outcome.error,
+            )
+            return None
+
+        semantic_state = self._apply_analysis_outcome_to_report(
+            report=report,
+            outcome=outcome,
+            analysis_config=analysis_config,
+        )
+
+        return (
+            report,
+            ReportBuildMetrics(
+                load_messages_ms=load_messages_ms,
+                aggregate_stats_ms=aggregate_stats_ms,
+                llm_analysis_ms=llm_analysis_ms,
+                build_path="incremental_update",
+                delta_message_count=len(delta_messages),
+                incremental_round=incremental_round,
+            ),
+            updated_stats_state,
+            semantic_state,
+        )
+
+    async def _write_cache_record(
+        self,
+        *,
+        report: DigestReport,
+        cache_mode: ReportMode,
+        group_id: str,
+        window: ReportWindow,
+        source: str,
+        config: LLMAnalysisConfig,
+        prompt_signature: str,
+        provider_id: str,
+        effective_state: EffectiveMessageState,
+        stats_state: dict[str, Any],
+        semantic_state: dict[str, Any],
+        incremental_round: int,
+    ) -> None:
+        if self.report_cache_store is None:
+            return
+
+        record = ReportCacheRecord(
+            group_id=group_id,
+            date=window.date_label,
+            mode=cache_mode,
+            window_start=window.start_ts,
+            window_end=window.end_ts,
+            generated_at=datetime.now().isoformat(timespec="seconds"),
+            last_message_timestamp=effective_state.last_message_ts,
+            message_count=effective_state.message_count,
+            provider_id=provider_id,
+            analysis_provider_notice=report.analysis_notice,
+            max_messages_for_analysis=config.max_messages_for_analysis,
+            prompt_signature=prompt_signature,
+            cache_version=self.cache_version,
+            source=source,
+            report=self._report_to_payload(report),
+            effective_message_count=effective_state.message_count,
+            effective_last_message_ts=effective_state.last_message_ts,
+            effective_last_message_fingerprint=effective_state.last_message_fingerprint,
+            stats_state=stats_state if isinstance(stats_state, dict) else {},
+            semantic_state=semantic_state if isinstance(semantic_state, dict) else {},
+            incremental_round=max(0, incremental_round),
+        )
+        await self.report_cache_store.upsert_record(record)
+        logger.info(
+            "[group_digest.cache] cache_write group_id=%s date=%s mode=%s source=%s effective_message_count=%s effective_last_message_ts=%s incremental_round=%d",
+            group_id,
+            window.date_label,
+            cache_mode,
+            source,
+            effective_state.message_count,
+            effective_state.last_message_ts,
+            max(0, incremental_round),
+        )
 
     def _build_prompt_signature(self, *, config: LLMAnalysisConfig, max_topics: int) -> str:
         payload = {
@@ -535,6 +913,99 @@ class GroupDigestService:
                 sorted(payload.keys()),
             )
             return None
+
+    def _semantic_state_from_semantic(self, semantic: LLMSemanticResult | None) -> dict[str, Any]:
+        if semantic is None:
+            return {}
+        return {
+            "group_topics": [str(item).strip() for item in semantic.group_topics if str(item).strip()],
+            "member_interests": {
+                str(name).strip(): str(summary).strip()
+                for name, summary in semantic.member_interests.items()
+                if str(name).strip() and str(summary).strip()
+            },
+            "overall_summary": str(semantic.overall_summary).strip(),
+            "suggested_bot_reply": str(semantic.suggested_bot_reply).strip(),
+        }
+
+    def _semantic_state_from_cache(self, cache_record: ReportCacheRecord) -> dict[str, Any]:
+        semantic_state = cache_record.semantic_state
+        if isinstance(semantic_state, dict):
+            parsed = self._parse_semantic_state_dict(semantic_state)
+            if parsed:
+                return parsed
+
+        report = self._report_from_payload(cache_record.report)
+        if report is not None and report.llm_semantic is not None:
+            parsed = self._semantic_state_from_semantic(report.llm_semantic)
+            if parsed:
+                return parsed
+        return {}
+
+    def _parse_semantic_state_dict(self, data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+
+        topics_raw = data.get("group_topics", [])
+        topics = [
+            str(item).strip()
+            for item in topics_raw
+            if str(item).strip()
+        ] if isinstance(topics_raw, list) else []
+
+        interests_raw = data.get("member_interests", {})
+        interests = (
+            {
+                str(name).strip(): str(summary).strip()
+                for name, summary in interests_raw.items()
+                if str(name).strip() and str(summary).strip()
+            }
+            if isinstance(interests_raw, dict)
+            else {}
+        )
+
+        overall_summary = str(data.get("overall_summary", "")).strip()
+        suggested = str(data.get("suggested_bot_reply", "")).strip()
+        if not topics or not overall_summary or not suggested:
+            return {}
+        return {
+            "group_topics": topics,
+            "member_interests": interests,
+            "overall_summary": overall_summary,
+            "suggested_bot_reply": suggested,
+        }
+
+    def _apply_analysis_outcome_to_report(
+        self,
+        *,
+        report: DigestReport,
+        outcome: Any,
+        analysis_config: LLMAnalysisConfig,
+    ) -> dict[str, Any]:
+        if outcome.semantic is not None:
+            outcome.semantic.suggested_bot_reply = self.interaction_service.finalize_suggested_reply(
+                outcome.semantic.suggested_bot_reply
+            )
+            report.llm_semantic = outcome.semantic
+            report.stats_only = False
+            report.analysis_notice = outcome.notice
+            report.analysis_provider_id = outcome.provider_id
+            return self._semantic_state_from_semantic(outcome.semantic)
+
+        if outcome.error:
+            report.analysis_provider_id = outcome.provider_id
+            if analysis_config.fallback_to_stats_only:
+                report.stats_only = True
+                report.analysis_notice = f"语义分析失败，已降级为仅统计：{outcome.error}"
+            else:
+                report.stats_only = True
+                report.analysis_notice = f"[ERROR] 语义分析失败：{outcome.error}"
+            return {}
+
+        report.stats_only = True
+        report.analysis_notice = outcome.notice or "语义分析已关闭，当前仅展示统计结果。"
+        report.analysis_provider_id = outcome.provider_id
+        return {}
 
     def _safe_int(self, value: object, *, field: str, default: int = 0) -> int:
         try:
@@ -681,30 +1152,52 @@ class GroupDigestService:
         messages: list[MessageRecord],
         max_active_members: int,
     ) -> DigestReport:
-        members_map: dict[str, list[MessageRecord]] = {}
-        for row in messages:
-            members_map.setdefault(row.sender_id, []).append(row)
+        stats_state = self.incremental_service.build_stats_state_from_messages(messages)
+        return self._build_stats_report_from_state(
+            period=period,
+            group_id=group_id,
+            window=window,
+            stats_state=stats_state,
+            max_active_members=max_active_members,
+        )
 
-        active_members: list[MemberDigest] = []
-        for sender_id, rows in members_map.items():
-            active_members.append(
-                MemberDigest(
-                    sender_id=sender_id,
-                    sender_name=rows[0].sender_name,
-                    message_count=len(rows),
-                )
-            )
-
-        active_members.sort(key=lambda item: (-item.message_count, item.sender_name))
-        active_members = active_members[:max_active_members]
-
+    def _build_stats_report_from_state(
+        self,
+        *,
+        period: PeriodType,
+        group_id: str,
+        window: ReportWindow,
+        stats_state: Any,
+        max_active_members: int,
+    ) -> DigestReport:
+        normalized = self.incremental_service.normalize_stats_state(stats_state)
+        if normalized is None:
+            normalized = {
+                "total_messages": 0,
+                "participant_count": 0,
+                "member_message_counts": {},
+            }
+        total_messages = self._safe_int(
+            normalized.get("total_messages", 0),
+            field="stats_state.total_messages",
+            default=0,
+        )
+        participant_count = self._safe_int(
+            normalized.get("participant_count", 0),
+            field="stats_state.participant_count",
+            default=0,
+        )
+        active_members = self.incremental_service.build_active_members_from_stats_state(
+            state=normalized,
+            max_active_members=max_active_members,
+        )
         return DigestReport(
             period=period,
             date_label=window.date_label,
             time_window=window.time_window,
             group_id=group_id,
-            total_messages=len(messages),
-            participant_count=len(members_map),
+            total_messages=max(0, total_messages),
+            participant_count=max(0, participant_count),
             active_members=active_members,
         )
 

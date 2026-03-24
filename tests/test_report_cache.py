@@ -147,14 +147,14 @@ def test_cache_hit_without_new_messages(tmp_path: Path) -> None:
     assert report.total_messages == 1
 
 
-def test_new_messages_trigger_full_rebuild(tmp_path: Path) -> None:
+def test_new_messages_trigger_incremental_update_for_today(tmp_path: Path) -> None:
     service, storage, _cache = _build_service(tmp_path)
     _append(storage, 
         MessageRecord("group_1001", "u1", "Alice", "第一条消息", int(datetime(2026, 3, 22, 10, 0, 0).timestamp()))
     )
 
     context = _StubContext(responses=[_valid_unified_json(), _valid_unified_json("第二次重算文案")])
-    _run(
+    _first_report, first_metrics = _run(
         service.build_report_for_period_with_metrics(
             context=context,
             event=_event(),
@@ -171,7 +171,7 @@ def test_new_messages_trigger_full_rebuild(tmp_path: Path) -> None:
         MessageRecord("group_1001", "u2", "Bob", "第二条消息", int(datetime(2026, 3, 22, 12, 30, 0).timestamp()))
     )
 
-    _run(
+    report, metrics = _run(
         service.build_report_for_period_with_metrics(
             context=context,
             event=_event(),
@@ -184,6 +184,12 @@ def test_new_messages_trigger_full_rebuild(tmp_path: Path) -> None:
         )
     )
 
+    assert report is not None
+    assert report.total_messages == 2
+    assert first_metrics.build_path == "full_rebuild"
+    assert metrics.build_path == "incremental_update"
+    assert metrics.delta_message_count == 1
+    assert metrics.incremental_round == 1
     assert context.llm_calls == 2
 
 
@@ -454,6 +460,370 @@ def test_scheduler_reuses_cache_without_real_new_messages(tmp_path: Path) -> Non
 
     assert context.llm_calls == 1
     assert context2.llm_calls == 0
+
+
+def test_scheduled_mode_small_delta_uses_incremental_update(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "17:50 之前消息", int(datetime(2026, 3, 22, 17, 50, 0).timestamp())),
+    )
+
+    context = _StubContext(responses=[_valid_unified_json(), _valid_unified_json("调度增量文案")])
+    _first_report, first_metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 18, 0, 0),
+            period="today",
+            mode="scheduled",
+            source="scheduler",
+            analysis_config=_base_config(),
+        )
+    )
+
+    _append(
+        storage,
+        MessageRecord("group_1001", "u2", "Bob", "18:05 新消息", int(datetime(2026, 3, 22, 18, 5, 0).timestamp())),
+    )
+
+    report, metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 18, 10, 0),
+            period="today",
+            mode="scheduled",
+            source="scheduler",
+            analysis_config=_base_config(),
+        )
+    )
+
+    assert report is not None
+    assert report.total_messages == 2
+    assert first_metrics.build_path == "full_rebuild"
+    assert metrics.build_path == "incremental_update"
+    assert metrics.delta_message_count == 1
+
+
+def test_yesterday_mode_with_new_messages_still_full_rebuild(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "昨天第一条", int(datetime(2026, 3, 21, 10, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(responses=[_valid_unified_json(), _valid_unified_json("昨天全量重算")])
+    _first_report, first_metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 9, 0, 0),
+            period="yesterday",
+            mode="yesterday",
+            source="command_group_digest",
+            analysis_config=_base_config(),
+        )
+    )
+
+    _append(
+        storage,
+        MessageRecord("group_1001", "u2", "Bob", "昨天新增补录", int(datetime(2026, 3, 21, 11, 0, 0).timestamp())),
+    )
+
+    report, metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 0, 0),
+            period="yesterday",
+            mode="yesterday",
+            source="command_group_digest",
+            analysis_config=_base_config(),
+        )
+    )
+
+    assert report is not None
+    assert report.total_messages == 2
+    assert first_metrics.build_path == "full_rebuild"
+    assert metrics.build_path == "full_rebuild"
+    assert context.llm_calls == 2
+
+
+def test_prompt_or_max_messages_change_falls_back_to_full_rebuild(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "固定消息", int(datetime(2026, 3, 22, 10, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(
+        responses=[
+            _valid_unified_json("第一次"),
+            _valid_unified_json("prompt 变化后"),
+            _valid_unified_json("max_messages 变化后"),
+        ]
+    )
+
+    _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 12, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+    _report2, metrics2 = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 12, 30, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(analysis_prompt_template="自定义模板：{group_id} {messages_json}"),
+        )
+    )
+    _report3, metrics3 = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 13, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(max_messages_for_analysis=20),
+        )
+    )
+
+    assert metrics2.build_path == "full_rebuild"
+    assert metrics3.build_path == "full_rebuild"
+    assert context.llm_calls == 3
+
+
+def test_delta_too_many_falls_back_to_full_rebuild(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "起始消息", int(datetime(2026, 3, 22, 9, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(responses=[_valid_unified_json("第一次"), _valid_unified_json("全量重算")])
+    _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    for i in range(25):
+        _append(
+            storage,
+            MessageRecord(
+                "group_1001",
+                f"u{i + 2}",
+                f"User{i + 2}",
+                f"新增消息 {i + 1}",
+                int(datetime(2026, 3, 22, 10, 1, i).timestamp()),
+            ),
+        )
+
+    report, metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 11, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    assert report is not None
+    assert report.total_messages == 26
+    assert metrics.build_path == "full_rebuild"
+    assert context.llm_calls == 2
+
+
+def test_checkpoint_corrupted_falls_back_to_full_rebuild(tmp_path: Path) -> None:
+    service, storage, cache_store = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "第一条", int(datetime(2026, 3, 22, 9, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(responses=[_valid_unified_json("第一次"), _valid_unified_json("损坏后全量")])
+    _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    # 手动破坏 checkpoint 的 stats_state，触发回退全量重算。
+    raw = cache_store._read_raw()  # type: ignore[attr-defined]
+    key = "group_1001::2026-03-22::today"
+    raw["entries"][key]["stats_state"] = "broken_stats_state"
+    cache_store._write_raw(raw)  # type: ignore[attr-defined]
+
+    _append(
+        storage,
+        MessageRecord("group_1001", "u2", "Bob", "第二条", int(datetime(2026, 3, 22, 10, 5, 0).timestamp())),
+    )
+
+    report, metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 11, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    assert report is not None
+    assert report.total_messages == 2
+    assert metrics.build_path == "full_rebuild"
+    assert context.llm_calls == 2
+
+
+def test_incremental_failure_falls_back_to_full_rebuild(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "第一条", int(datetime(2026, 3, 22, 9, 0, 0).timestamp())),
+    )
+
+    context = _StubContext(
+        responses=[
+            _valid_unified_json("第一次"),
+            "invalid-json-response",
+            _valid_unified_json("增量失败后全量重算"),
+        ]
+    )
+    _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+    _append(
+        storage,
+        MessageRecord("group_1001", "u2", "Bob", "第二条", int(datetime(2026, 3, 22, 10, 5, 0).timestamp())),
+    )
+
+    _report, metrics = _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 30, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    assert metrics.build_path == "full_rebuild"
+    assert context.llm_calls == 3
+    assert len(context.prompts) >= 3
+    assert "上一版语义状态（JSON）" in context.prompts[1]
+
+
+def test_incremental_round_limit_falls_back_to_full_rebuild(tmp_path: Path) -> None:
+    service, storage, _cache = _build_service(tmp_path)
+    _append(
+        storage,
+        MessageRecord("group_1001", "u1", "Alice", "起始", int(datetime(2026, 3, 22, 9, 0, 0).timestamp())),
+    )
+    context = _StubContext(
+        responses=[
+            _valid_unified_json("base"),
+            _valid_unified_json("inc1"),
+            _valid_unified_json("inc2"),
+            _valid_unified_json("inc3"),
+            _valid_unified_json("rebuild4"),
+        ]
+    )
+
+    _run(
+        service.build_report_for_period_with_metrics(
+            context=context,
+            event=_event(),
+            group_id="group_1001",
+            now=datetime(2026, 3, 22, 10, 0, 0),
+            period="today",
+            mode="today",
+            source="command_group_digest_today",
+            analysis_config=_base_config(),
+        )
+    )
+
+    metrics_by_round = []
+    for idx in range(1, 5):
+        _append(
+            storage,
+            MessageRecord(
+                "group_1001",
+                f"u{idx + 1}",
+                f"User{idx + 1}",
+                f"新增 {idx}",
+                int(datetime(2026, 3, 22, 10, idx, 0).timestamp()),
+            ),
+        )
+        _report, metrics = _run(
+            service.build_report_for_period_with_metrics(
+                context=context,
+                event=_event(),
+                group_id="group_1001",
+                now=datetime(2026, 3, 22, 10, idx, 30),
+                period="today",
+                mode="today",
+                source="command_group_digest_today",
+                analysis_config=_base_config(),
+            )
+        )
+        metrics_by_round.append(metrics)
+
+    assert metrics_by_round[0].build_path == "incremental_update"
+    assert metrics_by_round[1].build_path == "incremental_update"
+    assert metrics_by_round[2].build_path == "incremental_update"
+    assert metrics_by_round[3].build_path == "full_rebuild"
+    assert context.llm_calls == 5
 
 
 def test_failed_generation_does_not_overwrite_existing_cache(tmp_path: Path) -> None:
