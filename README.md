@@ -1,4 +1,4 @@
-# astrbot_plugin_group_digest
+# astrbot_plugin_group_understanding_with_memeory
 
 这是一个基于 AstrBot 的**群聊理解增强与长期记忆插件**。  
 本插件围绕群聊事实归档、话题切片、语义输入增强、增量更新与可复用记忆，形成了一条可持续运行的群聊理解链路。
